@@ -212,6 +212,7 @@ public class ViewVideoActivity extends AppCompatActivity implements CustomFontRe
     private float positionY = 0f;
     private float lastTouchX;
     private float lastTouchY;
+    private final int[] tmpLocation = new int[2]; // Scratch for getLocationInWindow (avoids per-event allocation)
     private int originalVideoWidth = 0; // Video dimensions (with embedded rotation applied)
     private int originalVideoHeight = 0;
 
@@ -1077,12 +1078,40 @@ public class ViewVideoActivity extends AppCompatActivity implements CustomFontRe
         public boolean onScale(ScaleGestureDetector detector) {
             wasScaling = true;
             userZoomed = true;
+            if (videoFrame == null) {
+                return true;
+            }
+            float oldScale = scaleFactor;
             scaleFactor *= detector.getScaleFactor();
             scaleFactor = Math.max(0.5f, Math.min(scaleFactor, 3.0f));
-            if (videoFrame != null) {
-                videoFrame.setScaleX(scaleFactor);
-                videoFrame.setScaleY(scaleFactor);
+            float ratio = scaleFactor / oldScale;
+
+            // Keep the content under the pinch focal point pinned in place. The frame scales
+            // around its centre pivot, so each scale step is paired with a pan-translation
+            // shift that cancels the movement the focal point would otherwise undergo. Because
+            // the scale is isotropic this compensation is independent of the frame's rotation.
+            if (videoFrame.getParent() instanceof View) {
+                ((View) videoFrame.getParent()).getLocationInWindow(tmpLocation);
+                // Screen position the centre pivot maps to with the current translation removed;
+                // detector focal coords are in the same window space as our pan translation.
+                float pivotScreenX = tmpLocation[0] + videoFrame.getLeft() + videoFrame.getPivotX();
+                float pivotScreenY = tmpLocation[1] + videoFrame.getTop() + videoFrame.getPivotY();
+                float focusX = detector.getFocusX();
+                float focusY = detector.getFocusY();
+                positionX = focusX - pivotScreenX - ratio * (focusX - pivotScreenX - positionX);
+                positionY = focusY - pivotScreenY - ratio * (focusY - pivotScreenY - positionY);
             }
+
+            // Don't let the zoomed frame drift past its edges (mirrors the pan clamp).
+            float maxDeltaX = Math.max(0f, (videoFrame.getWidth() * (scaleFactor - 1)) / 2f);
+            float maxDeltaY = Math.max(0f, (videoFrame.getHeight() * (scaleFactor - 1)) / 2f);
+            positionX = Math.max(-maxDeltaX, Math.min(maxDeltaX, positionX));
+            positionY = Math.max(-maxDeltaY, Math.min(maxDeltaY, positionY));
+
+            videoFrame.setScaleX(scaleFactor);
+            videoFrame.setScaleY(scaleFactor);
+            videoFrame.setTranslationX(positionX);
+            videoFrame.setTranslationY(positionY);
             return true;
         }
 
@@ -1146,6 +1175,18 @@ public class ViewVideoActivity extends AppCompatActivity implements CustomFontRe
                     lastTouchX = ev.getX();
                     lastTouchY = ev.getY();
                     break;
+                case MotionEvent.ACTION_POINTER_UP: {
+                    // A finger lifted from a multi-touch gesture (e.g. ending a pinch). Re-anchor
+                    // the pan baseline to whichever finger remains down; otherwise the next
+                    // ACTION_MOVE measures the pan delta from a stale anchor and the frame jumps.
+                    int liftedIndex = ev.getActionIndex();
+                    int remainingIndex = liftedIndex == 0 ? 1 : 0;
+                    if (remainingIndex < ev.getPointerCount()) {
+                        lastTouchX = ev.getX(remainingIndex);
+                        lastTouchY = ev.getY(remainingIndex);
+                    }
+                    break;
+                }
                 case MotionEvent.ACTION_MOVE:
                     // Pan while zoomed in (single finger, not mid-pinch).
                     if (scaleFactor > 1.0f && !scaling && ev.getPointerCount() == 1) {
