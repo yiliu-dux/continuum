@@ -1790,7 +1790,15 @@ public class PostRecyclerViewAdapter extends PagingDataAdapter<Post, RecyclerVie
         return thumbnailUrl != null && !thumbnailUrl.isEmpty() && !thumbnailUrl.equals("self") && !thumbnailUrl.equals("default") && !thumbnailUrl.equals("nsfw") && !thumbnailUrl.equals("spoiler") && !thumbnailUrl.equals("image") && thumbnailUrl.startsWith("http");
     }
 
+    // yil: personal override - keep card previews for text-link posts instead of forcing compact.
+    // Kept as a guard clause (rather than editing the return below) so upstream changes to the
+    // original logic keep applying cleanly without a merge conflict on this line.
+    private static final boolean DISABLE_FORCED_COMPACT_LAYOUT = true;
+
     private boolean shouldUseCompactLayout(Post post) {
+        if (DISABLE_FORCED_COMPACT_LAYOUT) {
+            return false;
+        }
         return (post.getPreviews() == null || post.getPreviews().isEmpty()) && !hasValidThumbnailFallback(post.getThumbnailUrl());
     }
 

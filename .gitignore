@@ -135,3 +135,5 @@ notes/*
 android-button-masher/*
 
 .kotlin
+/myvenv
+/.kotlin

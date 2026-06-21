@@ -354,6 +354,19 @@ public final class Utils {
     }
 
     public static void setHTMLWithImageToTextView(TextView textView, String content, boolean enlargeImage) {
+        // Skip re-rendering when this TextView already shows the exact same HTML. Otherwise every
+        // rebind (e.g. when a comment is collapsed) starts a fresh async image load whose span has
+        // zero bounds until the image arrives, so the flair briefly collapses to no height and then
+        // grows back, shifting the layout and jumping the scroll position. The text-length check
+        // guards against adapters that clear the flair text on recycle (setText("")) and then reuse
+        // the holder for an item with identical flair.
+        CharSequence currentText = textView.getText();
+        if (currentText != null && currentText.length() > 0
+                && Objects.equals(content, textView.getTag(R.id.html_image_content_tag))) {
+            return;
+        }
+        textView.setTag(R.id.html_image_content_tag, content);
+
         GlideImageGetter glideImageGetter = new GlideImageGetter(textView, enlargeImage);
         Spannable html = (Spannable) HtmlCompat.fromHtml(
                 content, HtmlCompat.FROM_HTML_MODE_LEGACY, glideImageGetter, null);
