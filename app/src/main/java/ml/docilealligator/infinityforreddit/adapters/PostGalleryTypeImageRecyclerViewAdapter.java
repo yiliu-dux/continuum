@@ -12,6 +12,7 @@ import android.view.ViewGroup;
 import android.widget.ImageView;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.recyclerview.widget.GridLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 import com.bumptech.glide.RequestBuilder;
 import com.bumptech.glide.RequestManager;
@@ -119,37 +120,21 @@ public class PostGalleryTypeImageRecyclerViewAdapter extends RecyclerView.Adapte
 
         ImageView imageView = holder.binding.imageViewItemGalleryImageInPostFeed;
 
-        // Drop any listener left over from a previous bind of this recycled holder.
-        if (holder.pendingLayoutListener != null) {
-            imageView.removeOnLayoutChangeListener(holder.pendingLayoutListener);
-            holder.pendingLayoutListener = null;
+        // Nothing has been decoded for what this holder is about to show.
+        holder.loadedWidth = 0;
+        holder.loadedHeight = 0;
+
+        // The tile watches its own layout for as long as it is bound, and every pass asks for the
+        // image again at the size the tile should be -- see requestBox(), which is what decides
+        // that, deliberately not trusting the view's own measurements. Loading once at the first
+        // plausible moment is what this used to do, and there is no such moment: the sizes a tile
+        // is measured at before it settles range from a hundred pixels to several thousand.
+        if (holder.layoutListener == null) {
+            holder.layoutListener = (v, l, t, r, b, oldL, oldT, oldR, oldB) -> loadImageIfNeeded(holder);
+            imageView.addOnLayoutChangeListener(holder.layoutListener);
         }
 
-        if (hasUsableWidth(imageView)) {
-            // The recycled view is already laid out at its final width, so no layout change will
-            // fire. Load now — otherwise loadImage() would never run and the spinner spins forever.
-            loadImage(holder);
-        } else {
-            holder.pendingLayoutListener = new View.OnLayoutChangeListener() {
-                @Override
-                public void onLayoutChange(View v, int left, int top, int right, int bottom, int oldLeft, int oldTop, int oldRight, int oldBottom) {
-                    int viewWidth = right - left;
-                    // In split/weighted layouts, views get intermediate layout passes with
-                    // incorrect (tiny) dimensions. Skip those and wait for the real size.
-                    ViewGroup parent = (ViewGroup) v.getParent();
-                    while (parent != null && !(parent instanceof RecyclerView)) {
-                        parent = (ViewGroup) parent.getParent();
-                    }
-                    if (parent != null && parent.getWidth() > 0 && viewWidth < parent.getWidth() / 2) {
-                        return;
-                    }
-                    v.removeOnLayoutChangeListener(this);
-                    holder.pendingLayoutListener = null;
-                    loadImage(holder);
-                }
-            };
-            imageView.addOnLayoutChangeListener(holder.pendingLayoutListener);
-        }
+        loadImageIfNeeded(holder);
 
         if (showCaption) {
             loadCaptionPreview(holder);
@@ -176,10 +161,12 @@ public class PostGalleryTypeImageRecyclerViewAdapter extends RecyclerView.Adapte
     @Override
     public void onViewRecycled(@NonNull ImageViewHolder holder) {
         super.onViewRecycled(holder);
-        if (holder.pendingLayoutListener != null) {
-            holder.binding.imageViewItemGalleryImageInPostFeed.removeOnLayoutChangeListener(holder.pendingLayoutListener);
-            holder.pendingLayoutListener = null;
+        if (holder.layoutListener != null) {
+            holder.binding.imageViewItemGalleryImageInPostFeed.removeOnLayoutChangeListener(holder.layoutListener);
+            holder.layoutListener = null;
         }
+        holder.loadedWidth = 0;
+        holder.loadedHeight = 0;
         holder.binding.captionConstraintLayoutItemGalleryImageInPostFeed.setVisibility(View.GONE);
         holder.binding.captionTextViewItemGalleryImageInPostFeed.setText("");
         holder.binding.captionUrlTextViewItemGalleryImageInPostFeed.setText("");
@@ -188,21 +175,76 @@ public class PostGalleryTypeImageRecyclerViewAdapter extends RecyclerView.Adapte
         glide.clear(holder.binding.imageViewItemGalleryImageInPostFeed);
     }
 
-    // Whether the view already has its final width, mirroring the guard in the layout listener: a
-    // width below half the RecyclerView width is an intermediate (split/weighted) layout pass.
-    private boolean hasUsableWidth(View imageView) {
-        int viewWidth = imageView.getWidth();
-        if (viewWidth <= 0) {
-            return false;
+    /**
+     * Issues the load unless the image already on screen was decoded for a box at least this big.
+     *
+     * <p>The size asked for is {@link #requestBox}'s, not the view's, so this runs on every layout
+     * without a bad measurement ever reaching Glide.
+     */
+    private void loadImageIfNeeded(ImageViewHolder holder) {
+        int[] box = requestBox(holder);
+        if (box[0] <= holder.loadedWidth && box[1] <= holder.loadedHeight) {
+            return;
         }
-        ViewGroup parent = (ViewGroup) imageView.getParent();
-        while (parent != null && !(parent instanceof RecyclerView)) {
-            parent = (ViewGroup) parent.getParent();
+        loadImage(holder, box);
+    }
+
+    /**
+     * The box to decode for, which is the view's own measurements only when they are credible.
+     *
+     * <p>The view's size cannot simply be trusted. A horizontal RecyclerView whose own width is
+     * unconstrained -- which is what a weighted split layout hands it before it has distributed
+     * widths -- sizes itself from its children, and with {@code match_parent} tiles that feeds
+     * back: the row takes its children's width, the children are measured against the wider row,
+     * and each pass multiplies it again. Measured on a 1968px display, one tile was handed 119px
+     * and 4888px within the same second. Decoding for either is wrong, and the 119px one is
+     * catastrophic -- the bitmap it yields is then stretched across the real tile.
+     *
+     * <p>So a measurement is used only when it is between half of and all of the width the row
+     * will settle at; anything else falls back to that settled width, which is derived from the
+     * display rather than from a measurement in flight. The load therefore always happens -- there
+     * is no state in which a tile waits forever for a size it likes -- and always at a size the
+     * tile can actually be.
+     */
+    private int[] requestBox(ImageViewHolder holder) {
+        ImageView imageView = holder.binding.imageViewItemGalleryImageInPostFeed;
+        int settledWidth = settledTileWidth(imageView);
+        int width = imageView.getWidth();
+        int height = imageView.getHeight();
+        if (width < (settledWidth + 1) / 2 || width > settledWidth || height <= 0) {
+            width = settledWidth;
+            height = ratio > 0 ? (int) (width * ratio) : width;
+            if (maxPreviewHeight > 0 && height > maxPreviewHeight) {
+                height = maxPreviewHeight;
+            }
         }
-        return parent == null || parent.getWidth() <= 0 || viewWidth >= parent.getWidth() / 2;
+        return new int[]{Math.max(1, width), Math.max(1, height)};
+    }
+
+    /**
+     * The width one tile settles at: the row's width divided between its columns, with the row
+     * itself capped to the display. The cap is what keeps a runaway measurement out -- a row can
+     * report itself wider than the screen, but a tile is never actually drawn wider than that.
+     */
+    private int settledTileWidth(ImageView imageView) {
+        int displayWidth = imageView.getResources().getDisplayMetrics().widthPixels;
+        int rowWidth = attachedRecyclerView == null ? 0 : attachedRecyclerView.getWidth();
+        if (rowWidth <= 0 || rowWidth > displayWidth) {
+            rowWidth = displayWidth;
+        }
+        int spanCount = 1;
+        if (attachedRecyclerView != null
+                && attachedRecyclerView.getLayoutManager() instanceof GridLayoutManager) {
+            spanCount = Math.max(1, ((GridLayoutManager) attachedRecyclerView.getLayoutManager()).getSpanCount());
+        }
+        return Math.max(1, rowWidth / spanCount);
     }
 
     private void loadImage(ImageViewHolder holder) {
+        loadImage(holder, requestBox(holder));
+    }
+
+    private void loadImage(ImageViewHolder holder, int[] box) {
         if (galleryImages == null || galleryImages.isEmpty()) {
             return;
         }
@@ -210,6 +252,12 @@ public class PostGalleryTypeImageRecyclerViewAdapter extends RecyclerView.Adapte
         if (index < 0 || index >= galleryImages.size()) {
             return;
         }
+
+        ImageView imageView = holder.binding.imageViewItemGalleryImageInPostFeed;
+        // The box this request is sized for. Recorded before the request goes out so a later
+        // layout can tell whether the tile has outgrown what is on screen.
+        holder.loadedWidth = box[0];
+        holder.loadedHeight = box[1];
 
         Post.Gallery galleryImage = galleryImages.get(index);
         // Prefer the resolution-bounded feed preview, which for a gif is a static still. The source
@@ -225,7 +273,11 @@ public class PostGalleryTypeImageRecyclerViewAdapter extends RecyclerView.Adapte
         // still to fall back on showing the error tile. DATA caches the downloaded bytes instead,
         // which is the expensive half anyway.
         boolean animatedResource = loadSource && galleryImage.mediaType == Post.Gallery.TYPE_GIF;
+
         RequestBuilder<Drawable> imageRequestBuilder = glide.load(loadUrl)
+                // Sized explicitly rather than from the view, which Glide would otherwise read at
+                // whatever an in-flight layout pass left behind. See requestBox().
+                .override(box[0], box[1])
                 .diskCacheStrategy(animatedResource ? DiskCacheStrategy.DATA : DiskCacheStrategy.ALL)
                 .listener(new RequestListener<>() {
             @Override
@@ -261,18 +313,24 @@ public class PostGalleryTypeImageRecyclerViewAdapter extends RecyclerView.Adapte
             if (isGridLayout) {
                 imageRequestBuilder
                         .apply(RequestOptions.bitmapTransform(new MultiTransformation<>(new CenterCrop(), new RoundedCornersTransformation(32, 0), new BlurTransformation(50, 2))))
-                        .into(holder.binding.imageViewItemGalleryImageInPostFeed);
+                        .into(imageView);
             } else {
                 imageRequestBuilder.apply(RequestOptions.bitmapTransform(new BlurTransformation(50, 10)))
-                        .into(holder.binding.imageViewItemGalleryImageInPostFeed);
+                        .into(imageView);
             }
         } else {
             if (isGridLayout) {
                 imageRequestBuilder
                         .apply(RequestOptions.bitmapTransform(new MultiTransformation<>(new CenterCrop(), new RoundedCornersTransformation(32, 0))))
-                        .downsample(saveMemoryCenterInisdeDownsampleStrategy).into(holder.binding.imageViewItemGalleryImageInPostFeed);
+                        .downsample(saveMemoryCenterInisdeDownsampleStrategy).into(imageView);
+            } else if (imageView.getScaleType() == ImageView.ScaleType.CENTER_CROP) {
+                // Decode to fill the tile, because the tile crops to fill. centerInside() would
+                // decode to fit *inside* the box and the view would then scale that up to cover,
+                // by the image's entire aspect mismatch with the box -- several times over for a
+                // tall or panoramic image in the square tile, and it looks it.
+                imageRequestBuilder.centerCrop().downsample(saveMemoryCenterInisdeDownsampleStrategy).into(imageView);
             } else {
-                imageRequestBuilder.centerInside().downsample(saveMemoryCenterInisdeDownsampleStrategy).into(holder.binding.imageViewItemGalleryImageInPostFeed);
+                imageRequestBuilder.centerInside().downsample(saveMemoryCenterInisdeDownsampleStrategy).into(imageView);
             }
         }
     }
@@ -452,10 +510,14 @@ public class PostGalleryTypeImageRecyclerViewAdapter extends RecyclerView.Adapte
     class ImageViewHolder extends RecyclerView.ViewHolder {
 
         ItemGalleryImageInPostFeedBinding binding;
-        // The deferred-load layout listener for this holder, if it hasn't fired yet. Tracked so a
-        // stale one can be removed on rebind/recycle.
+        // Watches the tile's layout for as long as it is bound, so a box that grows after the
+        // image was decoded gets a load at the new size. Tracked so it can be removed on recycle.
         @Nullable
-        View.OnLayoutChangeListener pendingLayoutListener;
+        View.OnLayoutChangeListener layoutListener;
+        // The box the request currently on screen was sized for, or 0 when nothing has loaded for
+        // this holder's contents yet.
+        int loadedWidth;
+        int loadedHeight;
 
         public ImageViewHolder(ItemGalleryImageInPostFeedBinding binding) {
             super(binding.getRoot());
