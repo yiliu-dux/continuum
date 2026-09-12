@@ -150,11 +150,13 @@ public class PostGalleryTypeImageRecyclerViewAdapter extends RecyclerView.Adapte
     public void onAttachedToRecyclerView(@NonNull RecyclerView recyclerView) {
         super.onAttachedToRecyclerView(recyclerView);
         attachedRecyclerView = recyclerView;
+        recyclerView.addOnScrollListener(settleListener);
     }
 
     @Override
     public void onDetachedFromRecyclerView(@NonNull RecyclerView recyclerView) {
         super.onDetachedFromRecyclerView(recyclerView);
+        recyclerView.removeOnScrollListener(settleListener);
         attachedRecyclerView = null;
     }
 
@@ -186,8 +188,30 @@ public class PostGalleryTypeImageRecyclerViewAdapter extends RecyclerView.Adapte
         if (box[0] <= holder.loadedWidth && box[1] <= holder.loadedHeight) {
             return;
         }
+        // Not while the pager is moving. Glide's into() clears the ImageView before it starts, and
+        // setImageDrawable(null) calls requestLayout(); a layout pass in the middle of a drag
+        // re-anchors the pager and throws away the scroll that had accumulated. A tile that has
+        // nothing on it yet is exempt -- that is the image first appearing, not a reload -- and
+        // anything deferred here is picked up by settleListener once the pager stops.
+        if (holder.loadedWidth > 0 && attachedRecyclerView != null
+                && attachedRecyclerView.getScrollState() != RecyclerView.SCROLL_STATE_IDLE) {
+            return;
+        }
         loadImage(holder, box);
     }
+
+    /**
+     * Re-checks every attached tile once the pager settles, so a load {@link #loadImageIfNeeded}
+     * declined to issue mid-scroll is not lost.
+     */
+    private final RecyclerView.OnScrollListener settleListener = new RecyclerView.OnScrollListener() {
+        @Override
+        public void onScrollStateChanged(@NonNull RecyclerView recyclerView, int newState) {
+            if (newState == RecyclerView.SCROLL_STATE_IDLE) {
+                forEachAttachedHolder(PostGalleryTypeImageRecyclerViewAdapter.this::loadImageIfNeeded);
+            }
+        }
+    };
 
     /**
      * The box to decode for, which is the view's own measurements only when they are credible.
