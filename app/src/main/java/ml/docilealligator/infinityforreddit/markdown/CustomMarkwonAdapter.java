@@ -24,6 +24,8 @@ import ml.docilealligator.infinityforreddit.activities.BaseActivity;
 import ml.docilealligator.infinityforreddit.customviews.SpoilerOnClickTextView;
 import ml.docilealligator.infinityforreddit.markdown.imageandgif.ImageAndGifBlock;
 import ml.docilealligator.infinityforreddit.markdown.imageandgif.ImageAndGifEntry;
+import ml.docilealligator.infinityforreddit.markdown.video.VideoBlock;
+import ml.docilealligator.infinityforreddit.markdown.video.VideoEntry;
 import org.commonmark.node.Node;
 
 public class CustomMarkwonAdapter extends MarkwonAdapter {
@@ -167,6 +169,13 @@ public class CustomMarkwonAdapter extends MarkwonAdapter {
             }
         }
 
+        if (node instanceof VideoBlock && holder instanceof VideoEntry.Holder) {
+            // Same as the image block below: the frame has its own click listener, so it swallows
+            // the press.
+            forwardLongClickToBlock(((VideoEntry.Holder) holder).getBinding().frameLayoutMarkdownVideoBlock,
+                    holder.itemView);
+        }
+
         if (node instanceof ImageAndGifBlock) {
             if (onClickListener != null) {
                 holder.itemView.setOnClickListener(onClickListener);
@@ -176,6 +185,13 @@ public class CustomMarkwonAdapter extends MarkwonAdapter {
             }
 
             if (holder instanceof ImageAndGifEntry.Holder) {
+                // The image carries its own click listener, which opens the media and so makes the
+                // view consume touches. That leaves the long press that collapses a comment with
+                // nowhere to land: it never reaches the item view the listener above sits on, and a
+                // comment made mostly of images ends up with no area that collapses it. Hand the
+                // long press on to the block.
+                forwardLongClickToBlock(((ImageAndGifEntry.Holder) holder).binding.imageViewMarkdownImageAndGifBlock,
+                        holder.itemView);
                 ((ImageAndGifEntry.Holder) holder).binding.captionTextViewMarkdownImageAndGifBlock.setOnClickListener(view -> {
                     if (onClickListener != null
                             && ((ImageAndGifEntry.Holder) holder).binding.captionTextViewMarkdownImageAndGifBlock.getSelectionStart() == -1
@@ -193,6 +209,22 @@ public class CustomMarkwonAdapter extends MarkwonAdapter {
                 });
             }
         }
+    }
+
+    /**
+     * Makes a long press on {@code innerView} act as a long press on the block it belongs to.
+     * Needed for the views inside a block that are clickable in their own right, which therefore
+     * consume the gesture before the block sees it.
+     */
+    private void forwardLongClickToBlock(@NonNull View innerView, @NonNull View blockView) {
+        final View.OnLongClickListener listener = onLongClickListener;
+        if (listener == null) {
+            // Holders come from a shared pool, so a stale forwarder has to be taken off again.
+            innerView.setOnLongClickListener(null);
+            innerView.setLongClickable(false);
+            return;
+        }
+        innerView.setOnLongClickListener(view -> listener.onLongClick(blockView));
     }
 
     @Override

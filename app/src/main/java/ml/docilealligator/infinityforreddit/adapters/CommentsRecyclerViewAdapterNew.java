@@ -135,6 +135,14 @@ public class CommentsRecyclerViewAdapterNew extends ListAdapter<Comment, Recycle
     private boolean mNeedBlurNsfw;
     private boolean mDoNotBlurNsfwInNsfwSubreddits;
     private boolean mNeedBlurSpoiler;
+    /**
+     * Bumped whenever a setting the markdown renderer reads changes. Part of
+     * {@link #markdownRenderKey}, so those changes still reach bodies that would otherwise be
+     * skipped as unchanged.
+     */
+    private int mMarkdownRenderGeneration;
+    @Nullable
+    private Boolean mLastAppliedBlurImage;
     private final CommentRecyclerViewAdapterCallback mCommentRecyclerViewAdapterCallback;
     private final Drawable expandDrawable;
     private final Drawable collapseDrawable;
@@ -455,8 +463,14 @@ public class CommentsRecyclerViewAdapterNew extends ListAdapter<Comment, Recycle
 
                 if (comment.getAuthorFlairHTML() != null && !comment.getAuthorFlairHTML().equals("")) {
                     ((CommentBaseViewHolder) holder).authorFlairTextView.setVisibility(View.VISIBLE);
-                    Utils.setHTMLWithImageToTextView(((CommentBaseViewHolder) holder).authorFlairTextView, comment.getAuthorFlairHTML(), true);
-                    if (comment.isRecovered()) {
+                    // The Recovered badge is prepended to the rendered text below, so it is part of
+                    // what this view ends up showing and has to be part of the identity the render
+                    // is skipped on -- otherwise a holder reused for a comment with the same flair
+                    // but a different recovered state would keep the wrong badge.
+                    boolean rendered = Utils.setHTMLWithImageToTextView(
+                            ((CommentBaseViewHolder) holder).authorFlairTextView, comment.getAuthorFlairHTML(), true,
+                            comment.isRecovered() ? "recovered" : null);
+                    if (rendered && comment.isRecovered()) {
                         // Read back after the HTML pass rather than parsed twice: the flair may carry
                         // inline emoji images that only setHTMLWithImageToTextView knows how to build.
                         TextView flairTextView = ((CommentBaseViewHolder) holder).authorFlairTextView;
@@ -581,9 +595,20 @@ public class CommentsRecyclerViewAdapterNew extends ListAdapter<Comment, Recycle
                 mVideoEntry.setCurrentPostId(comment.getLinkId());
                 mVideoEntry.setCurrentPostTitle(linkTitle);
                 mVideoPlugin.setMediaMetadataMap(comment.getMediaMetadataMap());
-                ((CommentBaseViewHolder) holder).mMarkwonAdapter.setMarkdown(mCommentMarkwon, java.util.Objects.requireNonNullElse(comment.getCommentMarkdown(), ""));
-                // noinspection NotifyDataSetChanged
-                ((CommentBaseViewHolder) holder).mMarkwonAdapter.notifyDataSetChanged();
+                // Re-parsing the markdown and invalidating the nested adapter restarts every
+                // image and gif load in the body, which blanks them and then pops them back in.
+                // Rows rebind constantly -- collapsing a comment rebinds it and the rows around it
+                // -- so that reload is visible as a flicker on content that has not changed. Skip
+                // it when this holder already shows exactly this body; the nested adapter still
+                // holds the parsed nodes, and the entry state set just above stays accurate
+                // because the comment is the same one.
+                String markdownKey = markdownRenderKey(comment);
+                if (!markdownKey.equals(((CommentBaseViewHolder) holder).boundMarkdownKey)) {
+                    ((CommentBaseViewHolder) holder).boundMarkdownKey = markdownKey;
+                    ((CommentBaseViewHolder) holder).mMarkwonAdapter.setMarkdown(mCommentMarkwon, java.util.Objects.requireNonNullElse(comment.getCommentMarkdown(), ""));
+                    // noinspection NotifyDataSetChanged
+                    ((CommentBaseViewHolder) holder).mMarkwonAdapter.notifyDataSetChanged();
+                }
 
                 if (!mHideTheNumberOfVotes) {
                     String commentText = "";
@@ -868,6 +893,23 @@ public class CommentsRecyclerViewAdapterNew extends ListAdapter<Comment, Recycle
         mSearchedPosition = -1;
     }
 
+    /**
+     * Identifies everything a rendered comment body depends on, so a rebind can tell whether the
+     * nested markdown adapter already holds the right thing.
+     *
+     * <p>The comment id keeps a recycled holder from reusing another comment's nodes even in the
+     * unlikely case of identical markdown. The media metadata map decides what the image and emote
+     * plugins resolve at parse time, and it is carried by reference through the copies the
+     * view model makes on expand and collapse, so its identity is stable for an unchanged comment
+     * and differs once the comment is fetched afresh. The generation covers the settings the
+     * renderer reads but the comment does not carry.
+     */
+    private String markdownRenderKey(@NonNull Comment comment) {
+        return comment.getId() + '\u0000' + mMarkdownRenderGeneration
+                + '\u0000' + System.identityHashCode(comment.getMediaMetadataMap())
+                + '\u0000' + java.util.Objects.requireNonNullElse(comment.getCommentMarkdown(), "");
+    }
+
     @Override
     public void onViewRecycled(@NonNull RecyclerView.ViewHolder holder) {
         if (holder instanceof CommentBaseViewHolder) {
@@ -893,12 +935,17 @@ public class CommentsRecyclerViewAdapterNew extends ListAdapter<Comment, Recycle
     }
 
     public boolean setDataSavingMode(boolean dataSavingMode) {
-        return mEmotePlugin.setDataSavingMode(dataSavingMode) || mImageAndGifEntry.setDataSavingMode(dataSavingMode);
+        boolean changed = mEmotePlugin.setDataSavingMode(dataSavingMode) || mImageAndGifEntry.setDataSavingMode(dataSavingMode);
+        if (changed) {
+            mMarkdownRenderGeneration++;
+        }
+        return changed;
     }
 
     public void setAutoplayCommentGif(boolean autoplayCommentGif) {
         mImageAndGifEntry.setAutoplayCommentGif(autoplayCommentGif);
         mEmotePlugin.setAutoplayCommentGif(autoplayCommentGif);
+        mMarkdownRenderGeneration++;
     }
 
     public void updatePost(@NonNull Post post) {
@@ -936,11 +983,16 @@ public class CommentsRecyclerViewAdapterNew extends ListAdapter<Comment, Recycle
         if (post == null) {
             return;
         }
-        mImageAndGifEntry.setBlurImage(
-                (post.isNSFW() && mNeedBlurNsfw
-                        && !(mDoNotBlurNsfwInNsfwSubreddits && mFragment != null && mFragment.getIsNsfwSubreddit()))
-                        || (post.isSpoiler() && mNeedBlurSpoiler)
-        );
+        boolean blurImage = (post.isNSFW() && mNeedBlurNsfw
+                && !(mDoNotBlurNsfwInNsfwSubreddits && mFragment != null && mFragment.getIsNsfwSubreddit()))
+                || (post.isSpoiler() && mNeedBlurSpoiler);
+        mImageAndGifEntry.setBlurImage(blurImage);
+        // Only on an actual change: this runs on every data emission, and bumping the generation
+        // here unconditionally would re-render every comment body each time.
+        if (mLastAppliedBlurImage == null || mLastAppliedBlurImage != blurImage) {
+            mLastAppliedBlurImage = blurImage;
+            mMarkdownRenderGeneration++;
+        }
     }
 
     public interface CommentRecyclerViewAdapterCallback {
@@ -972,6 +1024,9 @@ public class CommentsRecyclerViewAdapterNew extends ListAdapter<Comment, Recycle
         CommentIndentationView commentIndentationView;
         View commentDivider;
         CustomMarkwonAdapter mMarkwonAdapter;
+        /** What {@link #mMarkwonAdapter} currently holds; see {@link #markdownRenderKey}. */
+        @Nullable
+        String boundMarkdownKey;
 
         CommentBaseViewHolder(@NonNull View itemView) {
             super(itemView);
@@ -1479,10 +1534,8 @@ public class CommentsRecyclerViewAdapterNew extends ListAdapter<Comment, Recycle
                     itemView.setOnLongClickListener(hideToolbarOnLongClickListener);
                     commentTimeTextView.setOnLongClickListener(hideToolbarOnLongClickListener);
                     mMarkwonAdapter.setOnLongClickListener(v -> {
-                        if (v instanceof TextView) {
-                            if (((TextView) v).getSelectionStart() == -1 && ((TextView) v).getSelectionEnd() == -1) {
-                                hideToolbar();
-                            }
+                        if (hasNoTextSelection(v)) {
+                            hideToolbar();
                         }
                         return true;
                     });
@@ -1513,10 +1566,8 @@ public class CommentsRecyclerViewAdapterNew extends ListAdapter<Comment, Recycle
                     commentTimeTextView.setOnClickListener(hideToolbarOnClickListener);
                 }
                 mMarkwonAdapter.setOnLongClickListener(view -> {
-                    if (view instanceof TextView) {
-                        if (((TextView) view).getSelectionStart() == -1 && ((TextView) view).getSelectionEnd() == -1) {
-                            expandComments();
-                        }
+                    if (hasNoTextSelection(view)) {
+                        expandComments();
                     }
                     return true;
                 });
@@ -1525,6 +1576,19 @@ public class CommentsRecyclerViewAdapterNew extends ListAdapter<Comment, Recycle
                     return true;
                 });
             }
+        }
+
+        /**
+         * Whether a long press on {@code view} should act on the comment rather than on selected
+         * text. Only a TextView can have a selection to protect; every other part of a comment
+         * body -- an image block, a video block -- has none, and dropping the gesture there used
+         * to leave a comment made mostly of media with no area that collapsed it.
+         */
+        private boolean hasNoTextSelection(View view) {
+            if (!(view instanceof TextView)) {
+                return true;
+            }
+            return ((TextView) view).getSelectionStart() == -1 && ((TextView) view).getSelectionEnd() == -1;
         }
 
         private void expandComments() {

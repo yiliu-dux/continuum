@@ -1160,7 +1160,7 @@ public class PostRecyclerViewAdapter extends PagingDataAdapter<Post, RecyclerVie
                         ((PostWithPreviewTypeViewHolder) holder).linkTextView.setVisibility(View.VISIBLE);
                         String domain = Uri.parse(post.getUrl()).getHost();
                         ((PostWithPreviewTypeViewHolder) holder).linkTextView.setText(domain);
-                        if (post.getPostType() == Post.NO_PREVIEW_LINK_TYPE) {
+                        if (post.getPostType() == Post.NO_PREVIEW_LINK_TYPE && !hasNothingToPreview(post)) {
                             ((PostWithPreviewTypeViewHolder) holder).imageViewNoPreviewGallery.setVisibility(View.VISIBLE);
                             ((PostWithPreviewTypeViewHolder) holder).imageViewNoPreviewGallery.setImageResource(R.drawable.ic_link_day_night_24dp);
                         }
@@ -1222,6 +1222,17 @@ public class PostRecyclerViewAdapter extends PagingDataAdapter<Post, RecyclerVie
                                 });
                                 // Hide placeholder since we have a preview (including thumbnail fallback)
                                 ((PostWithPreviewTypeViewHolder) holder).imageViewNoPreviewGallery.setVisibility(View.GONE);
+                            } else if (hasNothingToPreview(post)) {
+                                // No preview box at all: the card is the title and the domain.
+                                // Hidden explicitly rather than left to onViewRecycled, which only
+                                // runs when a holder actually goes back to the pool -- a holder
+                                // rebound in place would otherwise keep the previous post's box.
+                                if (((PostWithPreviewTypeViewHolder) holder).imageWrapperFrameLayout != null) {
+                                    ((PostWithPreviewTypeViewHolder) holder).imageWrapperFrameLayout.setVisibility(View.GONE);
+                                }
+                                ((PostWithPreviewTypeViewHolder) holder).imageView.setVisibility(View.GONE);
+                                ((PostWithPreviewTypeViewHolder) holder).imageViewNoPreviewGallery.setVisibility(View.GONE);
+                                ((PostWithPreviewTypeViewHolder) holder).videoOrGifIndicator.setVisibility(View.GONE);
                             } else {
                                 ((PostWithPreviewTypeViewHolder) holder).imageViewNoPreviewGallery.setVisibility(View.VISIBLE);
                                 if (post.getPostType() == Post.VIDEO_TYPE) {
@@ -1865,8 +1876,38 @@ public class PostRecyclerViewAdapter extends PagingDataAdapter<Post, RecyclerVie
         return thumbnailUrl != null && !thumbnailUrl.isEmpty() && !thumbnailUrl.equals("self") && !thumbnailUrl.equals("default") && !thumbnailUrl.equals("nsfw") && !thumbnailUrl.equals("spoiler") && !thumbnailUrl.equals("image") && thumbnailUrl.startsWith("http");
     }
 
+    /**
+     * yil: personal override -- a post with nothing to preview keeps the layout the feed is set
+     * to instead of being dropped into a compact row. Upstream swaps the row for a compact one,
+     * which reads as a stray post type in the middle of a card feed. Rows that would have been
+     * swapped instead draw as a card with no preview area at all; see {@link #hasNothingToPreview}.
+     *
+     * <p>Written as a guard clause rather than by editing the expression below, so upstream
+     * changes to the original rule keep applying cleanly.
+     */
+    private static final boolean DISABLE_FORCED_COMPACT_LAYOUT = true;
+
     private boolean shouldUseCompactLayout(Post post) {
+        if (DISABLE_FORCED_COMPACT_LAYOUT) {
+            return false;
+        }
         return (post.getPreviews() == null || post.getPreviews().isEmpty()) && !hasValidThumbnailFallback(post.getThumbnailUrl());
+    }
+
+    /**
+     * Whether a link post has no image of any kind to show -- no preview, and no thumbnail to fall
+     * back on. The card for one of these has nothing to put in its preview box, and a 150dp band
+     * of flat colour with a chain-link glyph in the middle is a worse answer than no box at all:
+     * the post is a title and a domain, so the card shows a title and a domain.
+     *
+     * <p>Only link posts. An image, gif, video or gallery post whose preview is missing still says
+     * so with the glyph, which is the same thing the card shows when data saving suppresses a
+     * preview it does have.
+     */
+    private boolean hasNothingToPreview(Post post) {
+        return (post.getPostType() == Post.LINK_TYPE || post.getPostType() == Post.NO_PREVIEW_LINK_TYPE)
+                && (post.getPreviews() == null || post.getPreviews().isEmpty())
+                && !hasValidThumbnailFallback(post.getThumbnailUrl());
     }
 
     /**

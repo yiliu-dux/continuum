@@ -233,6 +233,8 @@ public class ViewVideoActivity extends AppCompatActivity
     private float positionY = 0f;
     private float lastTouchX;
     private float lastTouchY;
+    // Scratch for getLocationInWindow, so the pinch handler allocates nothing per event.
+    private final int[] tmpLocation = new int[2];
     private int originalVideoWidth = 0; // Video dimensions (with embedded rotation applied)
     private int originalVideoHeight = 0;
 
@@ -1097,6 +1099,21 @@ public class ViewVideoActivity extends AppCompatActivity
         setSwipeToDismissEnabled(scaleFactor <= 1.0f);
     }
 
+    /**
+     * Holds the pan translation within the frame's own edges, so the zoomed video can never be
+     * dragged (or scaled) off past its own boundary. At or below fit scale there is no slack and
+     * the frame is pinned to the centre.
+     */
+    private void clampPosition() {
+        if (videoFrame == null) {
+            return;
+        }
+        float maxDeltaX = Math.max(0f, (videoFrame.getWidth() * (scaleFactor - 1)) / 2f);
+        float maxDeltaY = Math.max(0f, (videoFrame.getHeight() * (scaleFactor - 1)) / 2f);
+        positionX = Math.max(-maxDeltaX, Math.min(maxDeltaX, positionX));
+        positionY = Math.max(-maxDeltaY, Math.min(maxDeltaY, positionY));
+    }
+
     /** Resets the pan translation back to centre. */
     private void resetPosition() {
         positionX = 0f;
@@ -1113,12 +1130,40 @@ public class ViewVideoActivity extends AppCompatActivity
         public boolean onScale(ScaleGestureDetector detector) {
             wasScaling = true;
             userZoomed = true;
+            if (videoFrame == null) {
+                return true;
+            }
+
+            float previousScaleFactor = scaleFactor;
             scaleFactor *= detector.getScaleFactor();
             scaleFactor = Math.max(0.5f, Math.min(scaleFactor, 3.0f));
-            if (videoFrame != null) {
-                videoFrame.setScaleX(scaleFactor);
-                videoFrame.setScaleY(scaleFactor);
+            float ratio = scaleFactor / previousScaleFactor;
+
+            // Keep whatever is under the pinch pinned to the fingers. The frame scales about its
+            // own centre, so on its own a pinch anywhere else slides the content out from under
+            // the fingers; each scale step is paired with the pan translation that cancels that
+            // slide. The scale is isotropic, so this holds whatever the frame's rotation is.
+            if (videoFrame.getParent() instanceof View) {
+                ((View) videoFrame.getParent()).getLocationInWindow(tmpLocation);
+                // Where the centre pivot sits with the current translation taken out. The
+                // detector's focal point is in the same window space as our pan translation.
+                float pivotWindowX = tmpLocation[0] + videoFrame.getLeft() + videoFrame.getPivotX();
+                float pivotWindowY = tmpLocation[1] + videoFrame.getTop() + videoFrame.getPivotY();
+                float focusX = detector.getFocusX();
+                float focusY = detector.getFocusY();
+                positionX = focusX - pivotWindowX - ratio * (focusX - pivotWindowX - positionX);
+                positionY = focusY - pivotWindowY - ratio * (focusY - pivotWindowY - positionY);
             }
+
+            // Hold the frame inside its own edges, the same bound panning uses. Without it a
+            // zoom-out leaves a translation the new scale no longer allows, and the frame snaps
+            // back the moment something else clamps it -- on the first pan, or at resetPosition().
+            clampPosition();
+
+            videoFrame.setScaleX(scaleFactor);
+            videoFrame.setScaleY(scaleFactor);
+            videoFrame.setTranslationX(positionX);
+            videoFrame.setTranslationY(positionY);
             return true;
         }
 
@@ -1131,8 +1176,15 @@ public class ViewVideoActivity extends AppCompatActivity
                 if (videoFrame != null) {
                     videoFrame.setScaleX(scaleFactor);
                     videoFrame.setScaleY(scaleFactor);
+                    // Clamped, not recentred. The scale moved by at most 0.05 here, but the pan
+                    // can be anywhere, and a rotated video's fit scale is above 1 and so still has
+                    // room to pan -- recentring it threw the view across the screen on release.
+                    // With no rotation the fit scale is 1, where the clamp leaves no slack and
+                    // this recentres exactly as it used to.
+                    clampPosition();
+                    videoFrame.setTranslationX(positionX);
+                    videoFrame.setTranslationY(positionY);
                 }
-                resetPosition();
             } else if (scaleFactor <= 0.6f) {
                 resetPosition();
             }
@@ -1182,6 +1234,21 @@ public class ViewVideoActivity extends AppCompatActivity
                     lastTouchX = ev.getX();
                     lastTouchY = ev.getY();
                     break;
+                case MotionEvent.ACTION_POINTER_UP: {
+                    // A finger came off a multi-touch gesture, usually the end of a pinch. The pan
+                    // anchor still holds a position from before the pinch, and ev.getX() is about
+                    // to start reporting whichever finger is left -- possibly the other one. Left
+                    // alone, the next ACTION_MOVE measures its delta against that stale anchor and
+                    // the frame leaps by the distance between the two fingers. Re-anchor to the
+                    // finger that is staying down.
+                    int liftedIndex = ev.getActionIndex();
+                    int remainingIndex = liftedIndex == 0 ? 1 : 0;
+                    if (remainingIndex < ev.getPointerCount()) {
+                        lastTouchX = ev.getX(remainingIndex);
+                        lastTouchY = ev.getY(remainingIndex);
+                    }
+                    break;
+                }
                 case MotionEvent.ACTION_MOVE:
                     // Pan while zoomed in (single finger, not mid-pinch).
                     if (scaleFactor > 1.0f && !scaling && ev.getPointerCount() == 1) {
@@ -1196,10 +1263,7 @@ public class ViewVideoActivity extends AppCompatActivity
                         if (isDragging) {
                             positionX += dx;
                             positionY += dy;
-                            float maxDeltaX = (videoFrame.getWidth() * (scaleFactor - 1)) / 2f;
-                            float maxDeltaY = (videoFrame.getHeight() * (scaleFactor - 1)) / 2f;
-                            positionX = Math.max(-maxDeltaX, Math.min(maxDeltaX, positionX));
-                            positionY = Math.max(-maxDeltaY, Math.min(maxDeltaY, positionY));
+                            clampPosition();
                             videoFrame.setTranslationX(positionX);
                             videoFrame.setTranslationY(positionY);
                             wasDragging = true;
