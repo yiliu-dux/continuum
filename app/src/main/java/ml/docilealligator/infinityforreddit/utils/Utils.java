@@ -353,12 +353,46 @@ public final class Utils {
         }
     }
 
-    public static void setHTMLWithImageToTextView(TextView textView, String content, boolean enlargeImage) {
+    public static boolean setHTMLWithImageToTextView(TextView textView, String content, boolean enlargeImage) {
+        return setHTMLWithImageToTextView(textView, content, enlargeImage, null);
+    }
+
+    /**
+     * Renders {@code content} as HTML into {@code textView}, loading any inline images (flair
+     * emojis, most commonly) through {@link GlideImageGetter}.
+     *
+     * <p>Re-rendering is skipped when the view already shows exactly this content. Every render
+     * builds a fresh spannable whose image spans start out empty and are filled in by an
+     * asynchronous image load, so a rebind of unchanged content makes the icons blink out and back
+     * even though nothing about them changed. Recycled views rebind constantly -- collapsing one
+     * comment rebinds the rows around it -- so that blink is what the user actually sees.
+     *
+     * @param variantKey state the caller applies to the text itself after this returns (a
+     *                   prepended badge, say). It is part of what the view ends up showing, so it
+     *                   is folded into the identity check; pass null when {@code content} alone
+     *                   determines the rendered text.
+     * @return true when the view was (re)rendered, false when it already showed this exact content
+     *         and was left untouched -- callers that post-process the text must skip doing so
+     *         again on false, or they would stack their changes on each rebind.
+     */
+    public static boolean setHTMLWithImageToTextView(TextView textView, String content,
+                                                     boolean enlargeImage, @Nullable String variantKey) {
+        String identity = variantKey == null ? content : content + "\u0000" + variantKey;
+        CharSequence currentText = textView.getText();
+        // The text-length check guards against adapters that blank the view on recycle and then
+        // reuse it for an item whose content happens to be identical.
+        if (currentText != null && currentText.length() > 0
+                && Objects.equals(identity, textView.getTag(R.id.html_image_content_tag))) {
+            return false;
+        }
+        textView.setTag(R.id.html_image_content_tag, identity);
+
         GlideImageGetter glideImageGetter = new GlideImageGetter(textView, enlargeImage);
         Spannable html = (Spannable) HtmlCompat.fromHtml(
                 content, HtmlCompat.FROM_HTML_MODE_LEGACY, glideImageGetter, null);
 
         textView.setText(html);
+        return true;
     }
 
     public static int getConnectedNetwork(Context context) {

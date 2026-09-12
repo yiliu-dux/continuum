@@ -8,6 +8,7 @@ import android.graphics.Canvas;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.text.Html;
+import android.util.LruCache;
 import android.widget.TextView;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -20,6 +21,25 @@ import java.lang.ref.WeakReference;
 import java.util.Objects;
 
 public class GlideImageGetter implements Html.ImageGetter {
+
+    /**
+     * Decoded inline images, kept so a repeat render can apply one synchronously.
+     *
+     * <p>These are flair emojis and the like: a handful of tiny images that recur on row after row.
+     * Glide caches them too, but every Glide request hands its result back through an asynchronous
+     * callback, so the span is empty for at least one frame each time a view binds and the icon
+     * blinks. Holding the decoded bitmaps here lets {@link #getDrawable} fill the span before the
+     * caller sets the text, so a bitmap that has been seen once never blinks again.
+     *
+     * <p>Bounded by total bytes rather than entry count, so the cache stays small no matter how
+     * many distinct images a session sees.
+     */
+    private static final LruCache<String, Bitmap> IMAGE_CACHE = new LruCache<>(4 * 1024 * 1024) {
+        @Override
+        protected int sizeOf(@NonNull String key, @NonNull Bitmap value) {
+            return value.getByteCount();
+        }
+    };
 
     private final WeakReference<TextView> container;
     private boolean enlargeImage;
@@ -49,23 +69,33 @@ public class GlideImageGetter implements Html.ImageGetter {
             imagesHandler.addImage(source);
         }
 
-        BitmapDrawablePlaceholder drawable = new BitmapDrawablePlaceholder();
+        BitmapDrawablePlaceholder drawable = new BitmapDrawablePlaceholder(source);
 
         TextView containerView = container.get();
-        if (containerView != null) {
-            containerView.post(() -> {
-                TextView textView = container.get();
-                if (textView != null) {
-                    Context context = textView.getContext();
-                    if (!(context instanceof Activity && (((Activity) context).isFinishing() || ((Activity) context).isDestroyed()))) {
-                        Glide.with(context)
-                                .asBitmap()
-                                .load(source)
-                                .into(drawable);
-                    }
-                }
-            });
+        if (containerView == null) {
+            return drawable;
         }
+
+        // Already decoded: apply it now, before the caller sets the text, so the icon is there on
+        // the very first frame instead of appearing one asynchronous hop later.
+        Bitmap cached = IMAGE_CACHE.get(source);
+        if (cached != null && !cached.isRecycled()) {
+            drawable.sizeDrawable(new BitmapDrawable(containerView.getResources(), cached));
+            return drawable;
+        }
+
+        containerView.post(() -> {
+            TextView textView = container.get();
+            if (textView != null) {
+                Context context = textView.getContext();
+                if (!(context instanceof Activity && (((Activity) context).isFinishing() || ((Activity) context).isDestroyed()))) {
+                    Glide.with(context)
+                            .asBitmap()
+                            .load(source)
+                            .into(drawable);
+                }
+            }
+        });
 
         return drawable;
     }
@@ -74,10 +104,12 @@ public class GlideImageGetter implements Html.ImageGetter {
 
         @Nullable
         protected Drawable drawable;
+        private final String source;
 
-        BitmapDrawablePlaceholder() {
+        BitmapDrawablePlaceholder(String source) {
             super(Objects.requireNonNull(container.get()).getResources(),
                     Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888));
+            this.source = source;
             // Reserve the line box before the bitmap arrives. Until setBounds runs the drawable is
             // empty, and ImageSpan takes the span's width and line ascent straight from its bounds,
             // so a flair icon occupies nothing until it loads and then snaps to full size, growing
@@ -96,7 +128,8 @@ public class GlideImageGetter implements Html.ImageGetter {
             }
         }
 
-        private void setDrawable(Drawable drawable) {
+        /** Applies the image and its final bounds without touching the host TextView. */
+        private void sizeDrawable(Drawable drawable) {
             this.drawable = drawable;
             int drawableWidth = (int) (drawable.getIntrinsicWidth() * density);
             int drawableHeight = (int) (drawable.getIntrinsicHeight() * density);
@@ -105,7 +138,14 @@ public class GlideImageGetter implements Html.ImageGetter {
             drawableWidth = (int) (drawableHeight * ratio);
             drawable.setBounds(0, 0, drawableWidth, drawableHeight);
             setBounds(0, 0, drawableWidth, drawableHeight);
+        }
 
+        private void setDrawable(Drawable drawable) {
+            sizeDrawable(drawable);
+
+            // Re-set the text so the span is measured again against the now-sized drawable. Only
+            // needed for a drawable that arrives after the text was set, which is why the
+            // synchronous cache path in getDrawable() calls sizeDrawable() directly.
             TextView textView = container.get();
             if (textView != null) {
                 textView.setText(textView.getText());
@@ -133,6 +173,17 @@ public class GlideImageGetter implements Html.ImageGetter {
                 if (textView != null) {
                     Resources resources = textView.getResources();
                     if (resources != null) {
+                        // Cache a copy, not the delivered bitmap: Glide may return that one to its
+                        // pool when this target is cleared, which would leave a recycled bitmap in
+                        // IMAGE_CACHE. Inline images are small, so the copy is cheap.
+                        if (source != null && !bitmap.isRecycled()) {
+                            Bitmap.Config config = bitmap.getConfig() != null
+                                    ? bitmap.getConfig() : Bitmap.Config.ARGB_8888;
+                            Bitmap copy = bitmap.copy(config, false);
+                            if (copy != null) {
+                                IMAGE_CACHE.put(source, copy);
+                            }
+                        }
                         setDrawable(new BitmapDrawable(resources, bitmap));
                     }
                 }
