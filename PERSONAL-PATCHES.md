@@ -20,7 +20,7 @@ will drift; the named methods are the reliable anchors.
 | File | Issue | What is fork-local |
 | --- | --- | --- |
 | `SaveMemoryCenterInisdeDownsampleStrategy.java` | 4a | `getSampleSizeRounding` returns `QUALITY` |
-| `adapters/PostGalleryTypeImageRecyclerViewAdapter.java` | 4b, 4c | `requestBox`, `settledTileWidth`, `loadImageIfNeeded`, `override()`, the `CENTER_CROP` branch |
+| `adapters/PostGalleryTypeImageRecyclerViewAdapter.java` | 4b, 4c, 5 | `requestBox`, `settledTileWidth`, `loadImageIfNeeded`, `override()`, the `CENTER_CROP` branch, `settleListener` |
 | `adapters/PostRecyclerViewAdapter.java` | 1 | `DISABLE_FORCED_COMPACT_LAYOUT`, `hasNothingToPreview` and its two bind sites |
 | `adapters/CommentsRecyclerViewAdapterNew.java` | 2a, 2c, 2d | `markdownRenderKey`, `mMarkdownRenderGeneration`, `hasNoTextSelection`, the flair `rendered` guard |
 | `markdown/CustomMarkwonAdapter.java` | 2d | `forwardLongClickToBlock` and its two call sites |
@@ -252,7 +252,8 @@ measurement cannot reach the decoder. The load still always happens, so no tile 
 size it likes.
 
 The tile re-checks on every layout (`loadImageIfNeeded`, line ~184) and reloads only when the box it
-needs is bigger than the one already decoded, which is what makes it converge.
+needs is bigger than the one already decoded, which is what makes it converge. Issue 5 is the
+follow-on defect this re-checking introduced, and the guard that fixes it lives in the same method.
 
 ### 4c. Cropping tiles decoded to fit instead of to fill
 
@@ -283,6 +284,50 @@ Fixing it means loading `Post.Gallery.url` (the full-size source) when the tile 
 largest preview. That is a bandwidth decision, not a bug fix, so it has deliberately been left
 alone. Items whose *source* is small (a 505x423 image yielding a 320px preview) are upscaled for the
 same reason and cannot be fixed at all.
+
+---
+
+## 5. A two-image gallery would not swipe back in post detail
+
+**Symptom.** A gallery of exactly two images pages correctly in the feed. In post detail, 1 -> 2
+works but stutters as it finishes, and 2 -> 1 does not move at all — the page slides a few pixels
+under the finger and snaps back.
+
+**Cause.** Introduced by 4b, not by upstream. `loadImageIfNeeded` re-checks the tile on *every*
+layout pass, and a reload calls Glide's `into()`, which clears the `ImageView` first;
+`setImageDrawable(null)` calls `requestLayout()`. So a reload during a drag lays the pager out again,
+`LinearLayoutManager` re-anchors to the child it considers current, and the scroll accumulated so far
+is discarded.
+
+At page 2 of a two-page pager the anchor is the last item, so every frame re-pinned the pager to
+page 2 and re-applied only that frame's delta. The logs showed it exactly — across an entire failed
+back-swipe, `item1.left == -dx` on every single frame:
+
+```
+dx=-1   item1.left=1      dx=-36  item1.left=36
+dx=-76  item1.left=76     dx=-37  item1.left=37
+dx=-25  item1.left=25     dx=-31  item1.left=31
+```
+
+The same reset landed mid-flight on the forward swipe, which is what the stutter was. A 16-image
+gallery was unaffected because its anchor is an interior child that the drag keeps moving past.
+
+Worth recording, because both were checked first and neither was the problem: the geometry was
+always **correct** (`range` exactly twice `extent`, `canLeft=true` throughout), and
+`notifyDataSetChanged()` never ran during the drag.
+
+**Fix.** `loadImageIfNeeded` (line ~184) refuses to issue a reload while the pager is not
+`SCROLL_STATE_IDLE`. A tile with nothing on it yet is exempt (`holder.loadedWidth > 0`) — that is the
+image first appearing, not a reload, and blocking it would leave a tile blank. `settleListener`
+(line ~200) re-runs the check on every attached tile once the pager settles, so a deferred load is
+never lost. It uses upstream's own `forEachAttachedHolder`, and hooks upstream's
+`onAttachedToRecyclerView` / `onDetachedFromRecyclerView` with one line each.
+
+After the fix the same back-swipe accumulates cleanly the whole way — on a 984px-wide pager,
+`offset` 984 -> 973 -> 932 -> ... -> 492 at the fling, then decelerating to 0 — with no layout pass
+anywhere in the drag.
+
+If 4b is ever dropped, drop this with it: without the per-layout reload there is nothing to suppress.
 
 ---
 
